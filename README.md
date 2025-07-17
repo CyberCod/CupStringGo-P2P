@@ -20,7 +20,7 @@ Cup and String is a simple, secure peer-to-peer (P2P) file synchronization tool 
 IMPORTANT: You must run 'cupandstring.exe' with administrative privileges if you want it to be able to open ports.  If not, you will need to open the ports and the firewall manually.
 
 
-Note: Windows may flag the executable as suspicious because it is an unsigned binary from an unknown developer. This is a common false positive for custom tools—it performs no malicious actions, such as unauthorized access or data exfiltration. You can bypass the warning by clicking "More info" > "Run anyway," or add an exception in Windows Defender. For peace of mind, compile from source yourself. You don't have to trust me, have your favorite AI look at the project and sniff it out for nefarious bits.
+Note: Windows may flag the executable as suspicious because it is an unsigned binary from an unknown developer. This is a common false positive for custom tools—it performs no malicious actions, such as unauthorized access or data exfiltration. You can bypass the warning by clicking "More info" > "Run anyway," or add an exception in Windows Defender.  You don't have to trust me, have your favorite AI look at the project and sniff it out for nefarious bits. For peace of mind, compile from source yourself it is surprisingly easy with GO.
 
 ## Usage
 Run the executable:
