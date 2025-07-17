@@ -1,6 +1,6 @@
 # Cup and String P2P File Sync
 
-Cup and String is a simple, secure peer-to-peer (P2P) file synchronization tool built in Go. It allows two users to share files directly over the internet or a local network without relying on central servers. The tool uses IRC (Internet Relay Chat) for peer discovery and libp2p for establishing secure P2P connections. It's designed for ease of use, with automatic setup and NAT traversal features to work behind firewalls and routers.
+Cup and String is a simple, secure peer-to-peer (P2P) file synchronization tool built in Go. It allows two users to share files directly over the internet or a local network without relying on having control of central servers. The tool uses freely available IRC (Internet Relay Chat) for peer discovery and libp2p for establishing secure P2P connections. It's designed for ease of use, with automatic setup and NAT traversal features to work behind firewalls and routers, but this does require elevated privileges to use.  If you do not have admin access to your machine, the automatic firewall and router configuration probably will not work.  
 
 ## Features
 - **Direct P2P File Transfer**: Files are sent directly between peers using libp2p, with support for hole punching and relays for NAT traversal.
@@ -12,14 +12,15 @@ Cup and String is a simple, secure peer-to-peer (P2P) file synchronization tool 
 - **Cross-Internet Compatibility**: Works over WAN with public IP detection and relays; fallback to LAN for local networks.
 
 ## Installation
-1. Download the pre-built executable (`cupandstring.exe`) for Windows from the releases page.
+1. Download the pre-built executable (`cupandstring.exe`) for Windows from
+ 	Dropbox: https://www.dropbox.com/scl/fi/hvpcba3qisqdk1oiw6l57/cupandstring.rar?rlkey=fqyw7yj020qur0wdqvb8pbo8y&st=rrwo4tbb&dl=0
 2. Place it in a directory where you want to run the tool.
-3. Run `cupandstring.exe` to start the setup wizard.
+3. Right-click and run `cupandstring.exe` in administrator mode to start the setup wizard.
 
 IMPORTANT: You must run 'cupandstring.exe' with administrative privileges if you want it to be able to open ports.  If not, you will need to open the ports and the firewall manually.
 
 
-Note: Windows may flag the executable as suspicious because it is an unsigned binary from an unknown developer. This is a common false positive for custom tools—it performs no malicious actions, such as unauthorized access or data exfiltration. You can bypass SmartScreen by clicking "More info" > "Run anyway," or add an exception in Windows Defender. For peace of mind, compile from source yourself.
+Note: Windows may flag the executable as suspicious because it is an unsigned binary from an unknown developer. This is a common false positive for custom tools—it performs no malicious actions, such as unauthorized access or data exfiltration. You can bypass the warning by clicking "More info" > "Run anyway," or add an exception in Windows Defender. For peace of mind, compile from source yourself. You don't have to trust me, have your favorite AI look at the project and sniff it out for nefarious bits.
 
 ## Usage
 Run the executable:
