@@ -19,6 +19,8 @@ type Config struct {
 	LocalPort         int    `json:"local_port"`
 	ExternalIP        string `json:"external_ip"`
 	PairingSecret     string `json:"pairing_secret"`
+	RequireAdmin      bool   `json:"require_admin"`
+	NetworkMode       string `json:"network_mode"` // "LAN" or "Internet"
 }
 
 // LoadConfig loads configuration from a JSON file
@@ -54,6 +56,10 @@ func LoadConfig(filePath string) (*Config, error) {
 	if c.PairingSecret == "" {
 		c.PairingSecret = "Practice"
 	}
+	if c.NetworkMode == "" {
+		c.NetworkMode = "LAN" // Default to LAN mode
+	}
+	// RequireAdmin defaults to false (no default needed since bool zero value is false)
 	
 	// Validate required fields
 	if c.ExportFolder == "" || c.ImportFolder == "" || c.YourUsername == "" || c.RecipientUsername == "" {

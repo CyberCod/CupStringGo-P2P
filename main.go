@@ -3,219 +3,894 @@
 package main
 
 import (
-	"context"
-	"flag"
+	"crypto/rand"
+	"crypto/tls"
+	"encoding/hex"
 	"fmt"
 	"log"
+	"net"
 	"os"
-	"os/signal"
-	"runtime"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 
-	"github.com/libp2p/go-libp2p/core/host"
+	ircmsg "github.com/ergochat/irc-go/ircmsg"
+	ircreader "github.com/ergochat/irc-go/ircreader"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/widget"
 )
 
-var globalConfig *Config
-var activePortMapping *UPnPPortMapping // Global variable for UPnP port mapping
+type IRCClient struct {
+	conn          net.Conn
+	nick          string
+	channel       string
+	display       *widget.Label
+	scrollDisplay *container.Scroll
+	input         *widget.Entry
+	connectBtn    *widget.Button
+	disconnectBtn *widget.Button
+	tabs          *container.AppTabs
+	mu            sync.Mutex
+	connected     bool
+	reconnect     time.Duration
+}
+
+var (
+	logChan       chan string
+	p2pShutdown   func()
+	configPath    = "mysetup.json"
+	logFilePath   = "current_log.txt"
+	currentConfig *Config
+	configMu      sync.Mutex
+	logFile       *os.File
+	logFileMutex  sync.Mutex
+	allLogText    strings.Builder // Keep all log text in memory for display
+	allLogMutex   sync.RWMutex
+)
 
 func main() {
-	// Parse command line flags
-	configPath := flag.String("config", "mysetup.json", "Config file")
-	forceSetup := flag.Bool("setup", false, "Force setup mode even if config exists")
-	flag.Parse()
+	// Check if admin is required and restart if needed
+	checkAdminRequirements()
 
-	var config *Config
-	var err error
+	// Initialize log file first thing
+	initializeLogFile()
 
-	// Check if we need to run setup
-	needsSetup := *forceSetup || !configFileExists(*configPath)
+	// Set up logging redirection for GUI application
+	logChan = make(chan string, 1000)
+	
+	// FIXED: For GUI applications, only use channel writer (no os.Stdout)
+	log.SetOutput(&chanWriter{ch: logChan})
+	log.SetFlags(0) // No default timestamps, use TimestampLog
 
-	if needsSetup {
-		// Run interactive setup
-		config = RunSetup()
-		globalConfig = config
+	a := app.New()
+	w := a.NewWindow("CupStringGO-P2P")
+
+	client := &IRCClient{
+		display:   widget.NewLabel(""),
+		input:     widget.NewEntry(),
+		reconnect: time.Second,
+	}
+
+	// Check if we need initial setup
+	
+	// Start P2P only if config exists and is complete
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		// No config file exists - create defaults but don't start P2P/IRC
+		currentConfig = createDefaultConfig()
+		log.Println("=== FIRST TIME SETUP REQUIRED ===")
+		log.Println("Welcome to CupStringGO-P2P!")
+		log.Println("")
+		log.Println("Before the program can start, please fill out the Config tab:")
+		log.Println("1. Your Username - your identifier (letters/numbers/underscore only)")
+		log.Println("2. Recipient Username - who you want to connect to")
+		log.Println("3. Channel Name - IRC channel for discovery (optional, default is fine)")
+		log.Println("4. Pairing Secret - shared secret both users must know")
+		log.Println("5. Export/Import folders - where files are sent from/received to")
+		log.Println("")
+		log.Println("After filling these out, click 'Save Config' to start the P2P system.")
+		log.Println("=== CONFIGURATION REQUIRED ===")
 	} else {
-		// Load existing configuration
-		config, err = LoadConfig(*configPath)
+		// Config exists - try to load it
+		var err error
+		currentConfig, err = LoadConfig(configPath)
 		if err != nil {
-			log.Printf("Failed to load config, running setup: %v", err)
-			config = RunSetup()
-		}
-
-		// Re-detect IP and port for existing config (like PowerShell script does)
-		TimestampLog("Re-detecting network settings...")
-		
-		// Determine if this looks like a LAN or WAN IP to decide detection method
-		if isLanIP(config.ExternalIP) {
-			config.ExternalIP = detectLanIP()
+			log.Printf("Failed to load config: %v", err)
+			currentConfig = createDefaultConfig()
+		} else if !isConfigComplete(currentConfig) {
+			log.Println("=== CONFIGURATION INCOMPLETE ===")
+			log.Println("Your configuration is missing required fields.")
+			log.Println("Please check the Config tab and ensure these are filled:")
+			if currentConfig.YourUsername == "" {
+				log.Println("- Your Username")
+			}
+			if currentConfig.RecipientUsername == "" {
+				log.Println("- Recipient Username") 
+			}
+			if currentConfig.PairingSecret == "" {
+				log.Println("- Pairing Secret")
+			}
+			log.Println("Then click 'Save Config' to start the P2P system.")
+			log.Println("=== CONFIGURATION REQUIRED ===")
 		} else {
-			config.ExternalIP = detectWanIP()
+			// Config is complete - start P2P/IRC
+			forceSetup := false
+			p2pShutdown, err = RunP2P(configPath, forceSetup)
+			if err != nil {
+				log.Fatalf("P2P startup failed: %v", err)
+			}
 		}
-		TimestampLog("Detected IP: " + config.ExternalIP)
-
-		// Find free listen port
-		config.LocalPort = findFreeListenPort(config.LocalPort)
-		
-		// Create firewall rule for existing config
-		createFirewallRule(config.LocalPort)
-		
-		globalConfig = config
 	}
 
-	// Set up cleanup handler for firewall rules and UPnP mappings
-	defer CleanupSetup()
+	// FIXED: Proper cleanup on window close instead of defer
+	w.SetCloseIntercept(func() {
+		log.Println("Application closing...")
+		if p2pShutdown != nil {
+			p2pShutdown()
+		}
+		closeLogFile()
+		w.Close()
+	})
 
-	// Monitor goroutine count for debugging
-	initialGoroutines := runtime.NumGoroutine()
-	TimestampLog(fmt.Sprintf("Initial goroutine count: %d", initialGoroutines))
-
-	// Initialize networking sequentially to prevent resource conflicts
-	p2pHost, multiAddr, err := initializeNetworkingSequentially(globalConfig)
-	if err != nil {
-		log.Fatalf("Network initialization failed: %v", err)
+	// Access loaded config
+	configMu.Lock()
+	if currentConfig == nil {
+		log.Fatal("Config initialization failed")
 	}
-	defer p2pHost.Close()
+	configMu.Unlock()
 
-	var wg sync.WaitGroup
-	triggerChan := make(chan bool, 1) // For watcher to IRC trigger
+	// Config tab content
+	serverEntry := widget.NewEntry()
+	serverEntry.SetText(fmt.Sprintf("%s:%d", currentConfig.IRCServer, currentConfig.IRCPort))
+	nickEntry := widget.NewEntry()
+	nickEntry.SetText(currentConfig.YourUsername)
+	channelEntry := widget.NewEntry()
+	channelEntry.SetText(currentConfig.ChannelName)
+	exportEntry := widget.NewEntry()
+	exportEntry.SetText(currentConfig.ExportFolder)
+	importEntry := widget.NewEntry()
+	importEntry.SetText(currentConfig.ImportFolder)
+	recipientEntry := widget.NewEntry()
+	recipientEntry.SetText(currentConfig.RecipientUsername)
+	secretEntry := widget.NewEntry()
+	secretEntry.SetText(currentConfig.PairingSecret)
+	localPortEntry := widget.NewEntry() // Make it editable
+	localPortEntry.SetText(strconv.Itoa(currentConfig.LocalPort))
+	externalIPEntry := widget.NewEntry()
+	externalIPEntry.SetText(currentConfig.ExternalIP)
+	tlsCheck := widget.NewCheck("TLS Enabled", nil)
+	tlsCheck.SetChecked(currentConfig.TLSEnabled)
+	
+	adminCheck := widget.NewCheck("Run with Administrator privileges", nil)
+	adminCheck.SetChecked(currentConfig.RequireAdmin)
+	
+	// Network mode selector
+	networkModeSelect := widget.NewSelect([]string{"LAN", "Internet"}, func(value string) {
+		// Auto-detect appropriate IP when mode changes
+		if value == "LAN" {
+			detectedIP := detectLocalIP()
+			externalIPEntry.SetText(detectedIP)
+			log.Printf("LAN mode: detected IP %s", detectedIP)
+		} else if value == "Internet" {
+			// For Internet mode, detect WAN IP in background
+			go func() {
+				log.Println("Internet mode: detecting external IP...")
+				detectedIP := detectWanIPNonInteractive()
+				// Update UI on main thread
+				fyne.Do(func() {
+					if detectedIP != "" {
+						externalIPEntry.SetText(detectedIP)
+						log.Printf("Internet mode: detected external IP %s", detectedIP)
+					} else {
+						log.Println("Internet mode: could not detect external IP - please enter manually")
+					}
+				})
+			}()
+		}
+	})
+	networkModeSelect.SetSelected(currentConfig.NetworkMode)
 
-	// Start IRC bot
-	wg.Add(1)
+	saveBtn := widget.NewButton("Save Config", func() {
+		go saveConfigChanges(serverEntry.Text, nickEntry.Text, channelEntry.Text, exportEntry.Text, importEntry.Text, recipientEntry.Text, secretEntry.Text, localPortEntry.Text, externalIPEntry.Text, tlsCheck.Checked, adminCheck.Checked, networkModeSelect.Selected)
+	})
+
+	form := container.New(layout.NewFormLayout(),
+		widget.NewLabel("Server:"), serverEntry,
+		widget.NewLabel("Nick:"), nickEntry,
+		widget.NewLabel("Channel:"), channelEntry,
+		widget.NewLabel("Export Folder:"), exportEntry,
+		widget.NewLabel("Import Folder:"), importEntry,
+		widget.NewLabel("Recipient User:"), recipientEntry,
+		widget.NewLabel("Pairing Secret:"), secretEntry,
+		widget.NewLabel("Local Port:"), localPortEntry,
+		widget.NewLabel("External IP:"), externalIPEntry,
+		widget.NewLabel("TLS:"), tlsCheck,
+		widget.NewLabel("Network Mode:"), networkModeSelect,
+		widget.NewLabel("Admin Mode:"), adminCheck,
+	)
+	configContent := container.NewVBox(form, saveBtn)
+
+	// Chat tab content
+	client.scrollDisplay = container.NewScroll(client.display)
+	client.scrollDisplay.SetMinSize(fyne.NewSize(400, 300))
+	client.display.Wrapping = fyne.TextWrapWord
+
+	client.input.SetPlaceHolder("Type message...")
+	client.input.Disable() // Start disabled
+	client.input.OnSubmitted = func(msg string) {
+		if client.connected && strings.TrimSpace(msg) != "" {
+			client.send(fmt.Sprintf("PRIVMSG %s :%s", client.channel, msg))
+			client.appendDisplaySafe(fmt.Sprintf("You: %s", msg))
+			client.input.SetText("")
+		}
+	}
+	client.connectBtn = widget.NewButton("Connect", func() {
+		client.connect(serverEntry.Text, nickEntry.Text, channelEntry.Text, w)
+	})
+	client.disconnectBtn = widget.NewButton("Disconnect", func() {
+		client.disconnect()
+	})
+	client.disconnectBtn.Disable()
+	chatTop := container.NewHBox(client.connectBtn, client.disconnectBtn)
+	chatContent := container.NewBorder(chatTop, client.input, nil, nil, client.scrollDisplay)
+
+	// Logs tab content - ENHANCED with selectable text and buttons
+	logDisplay := widget.NewRichTextFromMarkdown("") // RichText instead of Label for selectability
+	logDisplay.Wrapping = fyne.TextWrapWord
+	logScroll := container.NewScroll(logDisplay)
+	logScroll.SetMinSize(fyne.NewSize(400, 300))
+	
+	// Add buttons for log operations
+	openEditorBtn := widget.NewButton("Open in Editor", func() {
+		go openLogInEditor() // Run in goroutine to avoid blocking
+	})
+	saveLogBtn := widget.NewButton("Save Log", func() {
+		go saveCurrentLog() // Run in goroutine to avoid blocking
+	})
+	clearLogBtn := widget.NewButton("Clear Display", func() {
+		clearLogDisplay(logDisplay) // This one can be immediate
+	})
+	
+	logButtons := container.NewHBox(openEditorBtn, saveLogBtn, clearLogBtn)
+	
+	// Log display goroutine
 	go func() {
-		defer wg.Done()
-		StartBot(globalConfig, multiAddr, p2pHost, triggerChan)
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Printf("Log display panic recovered: %v\n", r)
+			}
+		}()
+		
+		for msg := range logChan {
+			// Write to file immediately
+			writeToLogFile(msg)
+			
+			// Update in-memory log text
+			allLogMutex.Lock()
+			allLogText.WriteString(msg)
+			allLogMutex.Unlock()
+			
+			// FIXED: Use fyne.Do instead of fyne.DoAndWait to avoid threading issues
+			fyne.Do(func() {
+				// Get current content
+				allLogMutex.RLock()
+				fullText := allLogText.String()
+				allLogMutex.RUnlock()
+				
+				// Limit display size to prevent memory issues
+				displayText := fullText
+				if len(displayText) > 100000 { // Keep last 100KB of logs in display
+					lines := strings.Split(displayText, "\n")
+					if len(lines) > 500 {
+						displayText = strings.Join(lines[len(lines)-500:], "\n")
+					}
+				}
+				
+				// Update the RichText widget
+				logDisplay.ParseMarkdown("```\n" + displayText + "\n```")
+				logDisplay.Refresh()
+				logScroll.ScrollToBottom()
+			})
+		}
 	}()
+	
+	logsContent := container.NewBorder(logButtons, nil, nil, nil, logScroll)
 
-	// Start file watchers
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		StartWatchers(globalConfig, triggerChan)
-	}()
+	// Tabs
+	client.tabs = container.NewAppTabs(
+		container.NewTabItem("Config", configContent),
+		container.NewTabItem("Chat", chatContent),
+		container.NewTabItem("Logs", logsContent),
+	)
 
-	finalGoroutines := runtime.NumGoroutine()
-	TimestampLog(fmt.Sprintf("Final goroutine count: %d (started with %d)", finalGoroutines, initialGoroutines))
-	TimestampLog("Cup and String P2P File Sync started successfully")
-
-	// Wait for interrupt signal
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	<-sigChan
-
-	log.Println("Shutting down...")
-	TimestampLog("Received shutdown signal")
-	wg.Wait()
-	log.Println("Done.")
-	TimestampLog("Shutdown complete")
+	w.SetContent(client.tabs)
+	w.Resize(fyne.NewSize(500, 500))
+	w.ShowAndRun()
 }
 
-// initializeNetworkingSequentially handles UPnP and P2P host creation in proper sequence
-func initializeNetworkingSequentially(config *Config) (host.Host, string, error) {
-	TimestampLog("=== Starting Sequential Network Initialization ===")
+// Log file management functions
+
+func initializeLogFile() {
+	logFileMutex.Lock()
+	defer logFileMutex.Unlock()
 	
-	// Phase 1: UPnP setup with proper resource management
-	TimestampLog("Phase 1: Setting up UPnP with resource management...")
-	beforeUPnP := runtime.NumGoroutine()
+	// Close existing file if open
+	if logFile != nil {
+		logFile.Close()
+	}
 	
-	upnpManager, err := setupUPnPWithResourceManagement(config.LocalPort)
+	// Create/truncate the log file
+	var err error
+	logFile, err = os.Create(logFilePath)
 	if err != nil {
-		TimestampLog(fmt.Sprintf("UPnP setup failed (non-fatal): %v", err))
-		log.Printf("WARNING: UPnP automatic port opening failed: %v", err)
-		log.Println("You may need to manually configure port forwarding on your router")
+		fmt.Printf("Failed to create log file: %v\n", err)
+		return
+	}
+	
+	// Write session header
+	header := fmt.Sprintf("=== CupStringGO-P2P Log Session Started: %s ===\n", 
+		time.Now().Format("2006-01-02 15:04:05"))
+	logFile.WriteString(header)
+	logFile.Sync()
+	
+	// Initialize the in-memory log builder
+	allLogMutex.Lock()
+	allLogText.Reset()
+	allLogText.WriteString(header)
+	allLogMutex.Unlock()
+}
+
+func writeToLogFile(message string) {
+	logFileMutex.Lock()
+	defer logFileMutex.Unlock()
+	
+	if logFile != nil {
+		logFile.WriteString(message)
+		logFile.Sync() // Ensure it's written to disk immediately
+	}
+}
+
+func closeLogFile() {
+	logFileMutex.Lock()
+	defer logFileMutex.Unlock()
+	
+	if logFile != nil {
+		footer := fmt.Sprintf("\n=== Session Ended: %s ===\n", 
+			time.Now().Format("2006-01-02 15:04:05"))
+		logFile.WriteString(footer)
+		logFile.Close()
+		logFile = nil
+	}
+}
+
+// Button action functions
+
+func openLogInEditor() {
+	// Ensure log file is up to date
+	logFileMutex.Lock()
+	if logFile != nil {
+		logFile.Sync()
+	}
+	logFileMutex.Unlock()
+	
+	// Get absolute path to the log file
+	absPath, err := filepath.Abs(logFilePath)
+	if err != nil {
+		log.Printf("Failed to get absolute path for log file: %v", err)
+		return
+	}
+	
+	// Try to open with default editor (Windows)
+	cmd := exec.Command("notepad.exe", absPath)
+	err = cmd.Start()
+	if err != nil {
+		// Fallback: try to open with default associated program
+		cmd = exec.Command("cmd", "/C", "start", "", absPath)
+		err = cmd.Start()
+		if err != nil {
+			log.Printf("Failed to open log in editor: %v", err)
+			return
+		}
+	}
+	
+	log.Printf("Opened log file in editor: %s", absPath)
+}
+
+func saveCurrentLog() {
+	// The log is already being saved in real-time to current_log.txt
+	// This function could create a timestamped backup copy
+	
+	timestamp := time.Now().Format("20060102_150405")
+	backupPath := fmt.Sprintf("log_backup_%s.txt", timestamp)
+	
+	allLogMutex.RLock()
+	logContent := allLogText.String()
+	allLogMutex.RUnlock()
+	
+	err := os.WriteFile(backupPath, []byte(logContent), 0644)
+	if err != nil {
+		log.Printf("Failed to save log backup: %v", err)
+		return
+	}
+	
+	log.Printf("Log saved to backup file: %s", backupPath)
+}
+
+func clearLogDisplay(logDisplay *widget.RichText) {
+	// Clear only the display, not the actual log file or memory
+	fyne.Do(func() {
+		logDisplay.ParseMarkdown("```\nLog display cleared (file logging continues)\n```")
+		logDisplay.Refresh()
+	})
+	log.Println("Log display cleared by user")
+}
+
+func saveConfigChanges(server string, nick string, channel string, exportFolder string, importFolder string, recipient string, secret string, localPort string, externalIP string, tlsEnabled bool, requireAdmin bool, networkMode string) {
+	configMu.Lock()
+	oldConfig := *currentConfig
+	configMu.Unlock()
+
+	// Parse server and port
+	host, portStr := server, "6667"
+	if strings.Contains(server, ":") {
+		parts := strings.Split(server, ":")
+		host, portStr = parts[0], parts[1]
+	}
+	ircPortInt, _ := strconv.Atoi(portStr)
+	
+	// Parse local port
+	localPortInt, err := strconv.Atoi(localPort)
+	if err != nil {
+		log.Printf("Invalid local port '%s', keeping existing: %v", localPort, err)
+		localPortInt = oldConfig.LocalPort
+	}
+
+	newConfig := Config{
+		IRCServer:         host,
+		IRCPort:           ircPortInt,
+		YourUsername:      nick,
+		ChannelName:       channel,
+		ExportFolder:      exportFolder,
+		ImportFolder:      importFolder,
+		RecipientUsername: recipient,
+		PairingSecret:     secret,
+		LocalPort:         localPortInt, // Now editable
+		ExternalIP:        externalIP,
+		TLSEnabled:        tlsEnabled,
+		RequireAdmin:      requireAdmin,
+		NetworkMode:       networkMode,
+	}
+
+	// Check if this is the first complete config
+	wasIncomplete := !isConfigComplete(&oldConfig)
+	isNowComplete := isConfigComplete(&newConfig)
+
+	// Check if restart needed (server/port/TLS/IP/export/import/recipient/secret/channel/localport/admin/networkmode changed)
+	needsRestart := newConfig.IRCServer != oldConfig.IRCServer ||
+		newConfig.IRCPort != oldConfig.IRCPort ||
+		newConfig.ChannelName != oldConfig.ChannelName ||
+		newConfig.TLSEnabled != oldConfig.TLSEnabled ||
+		newConfig.ExportFolder != oldConfig.ExportFolder ||
+		newConfig.ImportFolder != oldConfig.ImportFolder ||
+		newConfig.RecipientUsername != oldConfig.RecipientUsername ||
+		newConfig.PairingSecret != oldConfig.PairingSecret ||
+		newConfig.ExternalIP != oldConfig.ExternalIP ||
+		newConfig.YourUsername != oldConfig.YourUsername ||
+		newConfig.LocalPort != oldConfig.LocalPort || // Add local port change detection
+		newConfig.RequireAdmin != oldConfig.RequireAdmin || // Add admin mode change detection
+		newConfig.NetworkMode != oldConfig.NetworkMode // Add network mode change detection
+
+	configMu.Lock()
+	*currentConfig = newConfig
+	configMu.Unlock()
+
+	if err := SaveConfig(configPath, &newConfig); err != nil {
+		log.Printf("Failed to save config: %v", err)
+		return
+	}
+
+	log.Println("Config saved successfully")
+
+	// Check if admin privileges changed and handle accordingly
+	if newConfig.RequireAdmin != oldConfig.RequireAdmin {
+		if newConfig.RequireAdmin && !isRunningAsAdmin() {
+			log.Println("Admin mode enabled but not running as admin - restarting with admin privileges...")
+			restartAsAdmin()
+			return
+		} else if !newConfig.RequireAdmin && isRunningAsAdmin() {
+			log.Println("Admin mode disabled - changes will take effect on next restart")
+		}
+	}
+
+	// If admin is required and we're not running as admin, restart
+	if newConfig.RequireAdmin && !isRunningAsAdmin() {
+		log.Println("Admin privileges required but not running as admin - restarting...")
+		restartAsAdmin()
+		return
+	}
+
+	// Start P2P for the first time if config is now complete
+	if wasIncomplete && isNowComplete {
+		log.Println("=== STARTING P2P SYSTEM ===")
+		log.Println("Configuration is now complete! Starting P2P and IRC systems...")
+		
+		var err error
+		p2pShutdown, err = RunP2P(configPath, false)
+		if err != nil {
+			log.Printf("P2P startup failed: %v", err)
+		} else {
+			log.Println("P2P system started successfully!")
+			log.Println("You can now send/receive files and the system will auto-discover peers.")
+		}
+	} else if isNowComplete && needsRestart && p2pShutdown != nil {
+		// Restart existing P2P system
+		log.Println("Configuration changed, restarting P2P system...")
+		p2pShutdown()
+		var err error
+		p2pShutdown, err = RunP2P(configPath, false)
+		if err != nil {
+			log.Printf("P2P restart failed: %v", err)
+		} else {
+			log.Println("P2P system restarted with new configuration")
+		}
+	} else if !isNowComplete {
+		log.Println("Configuration saved but still incomplete. Please fill all required fields.")
+	}
+}
+
+// Helper functions for config management
+
+func createDefaultConfig() *Config {
+	// Get current directory for default folders
+	currentDir, err := os.Getwd()
+	if err != nil {
+		currentDir = "."
+	}
+
+	return &Config{
+		IRCServer:         "irc.libera.chat",
+		IRCPort:           6697,
+		ChannelName:       "cupandstring",
+		TLSEnabled:        true,
+		YourUsername:      "", // User must fill
+		RecipientUsername: "", // User must fill
+		LocalPort:         4200,
+		ExternalIP:        detectLocalIP(), // Auto-detect
+		PairingSecret:     "", // User must fill or use default
+		ExportFolder:      filepath.Join(currentDir, "export"),
+		ImportFolder:      filepath.Join(currentDir, "import"),
+		RequireAdmin:      false, // Default to not requiring admin
+		NetworkMode:       "LAN", // Default to LAN mode
+	}
+}
+
+func isConfigComplete(config *Config) bool {
+	// Check required fields
+	return config.YourUsername != "" &&
+		config.RecipientUsername != "" &&
+		config.PairingSecret != "" &&
+		config.ExportFolder != "" &&
+		config.ImportFolder != ""
+}
+
+// detectLocalIP finds the best local network IP address (simplified version for GUI)
+func detectLocalIP() string {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return "127.0.0.1"
+	}
+
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+
+			if ip == nil || ip.To4() == nil {
+				continue
+			}
+
+			ipStr := ip.String()
+			if strings.HasPrefix(ipStr, "192.168.") {
+				return ipStr
+			}
+		}
+	}
+
+	return "127.0.0.1"
+}
+
+// Windows admin privilege functions
+
+var (
+	kernel32          = syscall.NewLazyDLL("kernel32.dll")
+	getCurrentProcess = kernel32.NewProc("GetCurrentProcess")
+	advapi32          = syscall.NewLazyDLL("advapi32.dll")
+	openProcessToken  = advapi32.NewProc("OpenProcessToken")
+	getTokenInfo      = advapi32.NewProc("GetTokenInformation")
+)
+
+// checkAdminRequirements checks if admin is required and restarts if needed
+func checkAdminRequirements() {
+	// Try to load config to see if admin is required
+	if config, err := LoadConfig(configPath); err == nil {
+		if config.RequireAdmin && !isRunningAsAdmin() {
+			log.Println("Admin privileges required, restarting as admin...")
+			restartAsAdmin()
+			return
+		}
+	}
+	// If config doesn't exist or doesn't require admin, continue normally
+}
+
+// isRunningAsAdmin checks if the current process is running with admin privileges
+func isRunningAsAdmin() bool {
+	var token syscall.Handle
+	var isAdmin bool
+
+	// Get current process handle
+	process, _, _ := getCurrentProcess.Call()
+
+	// Open process token
+	ret, _, _ := openProcessToken.Call(
+		process,
+		syscall.TOKEN_QUERY,
+		uintptr(unsafe.Pointer(&token)),
+	)
+	if ret == 0 {
+		return false
+	}
+	defer syscall.CloseHandle(token)
+
+	// Get token elevation information
+	var elevation uint32
+	var returnLength uint32
+	const TokenElevation = 20
+
+	ret, _, _ = getTokenInfo.Call(
+		uintptr(token),
+		TokenElevation,
+		uintptr(unsafe.Pointer(&elevation)),
+		uintptr(unsafe.Sizeof(elevation)),
+		uintptr(unsafe.Pointer(&returnLength)),
+	)
+	if ret == 0 {
+		return false
+	}
+
+	isAdmin = elevation != 0
+	log.Printf("Admin status check: %t", isAdmin)
+	return isAdmin
+}
+
+// restartAsAdmin restarts the application with admin privileges
+func restartAsAdmin() {
+	// Get current executable path
+	execPath, err := os.Executable()
+	if err != nil {
+		log.Printf("Failed to get executable path: %v", err)
+		return
+	}
+
+	// Get current working directory
+	workDir, err := os.Getwd()
+	if err != nil {
+		log.Printf("Failed to get working directory: %v", err)
+		workDir = filepath.Dir(execPath)
+	}
+
+	log.Printf("Restarting as admin: %s in %s", execPath, workDir)
+
+	// Use PowerShell to start with admin privileges
+	cmd := exec.Command("powershell", "-Command", 
+		fmt.Sprintf("Start-Process '%s' -WorkingDirectory '%s' -Verb RunAs", execPath, workDir))
+	
+	err = cmd.Start()
+	if err != nil {
+		log.Printf("Failed to restart as admin: %v", err)
+		return
+	}
+
+	// Exit current process
+	log.Println("Exiting current process...")
+	os.Exit(0)
+}
+type chanWriter struct {
+	ch chan string
+}
+
+func (cw *chanWriter) Write(p []byte) (n int, err error) {
+	if cw.ch == nil {
+		return len(p), nil // Safety check
+	}
+	
+	message := string(p)
+	select {
+	case cw.ch <- message:
+		// Message sent successfully
+	default:
+		// Channel full - this prevents blocking but loses the message
+		// In GUI mode, we prioritize not hanging the application
+	}
+	return len(p), nil
+}
+
+// IRCClient methods (unchanged)
+
+func (c *IRCClient) connect(server, nick, channel string, w fyne.Window) {
+	if c.conn != nil {
+		c.appendDisplay("Already connected!")
+		return
+	}
+
+	// Parse server:port, default 6667
+	host, portStr := server, "6667"
+	if strings.Contains(server, ":") {
+		parts := strings.Split(server, ":")
+		host, portStr = parts[0], parts[1]
+	}
+	portInt, err := strconv.Atoi(portStr)
+	if err != nil {
+		c.appendDisplay("Invalid port: " + err.Error())
+		return
+	}
+	tlsEnabled := portInt == 6697
+	addr := fmt.Sprintf("%s:%s", host, portStr)
+
+	// Random nick suffix
+	rnd := make([]byte, 4)
+	rand.Read(rnd)
+	c.nick = fmt.Sprintf("%s_%s", nick, hex.EncodeToString(rnd))
+	c.channel = strings.ToLower("#" + strings.TrimPrefix(channel, "#")) // Lowercase channel
+
+	var conn net.Conn
+	if tlsEnabled {
+		conn, err = tls.Dial("tcp", addr, &tls.Config{})
 	} else {
-		activePortMapping = upnpManager.GetMapping()
-		TimestampLog("UPnP setup completed successfully")
+		conn, err = net.Dial("tcp", addr)
 	}
-	
-	afterUPnP := runtime.NumGoroutine()
-	TimestampLog(fmt.Sprintf("Goroutines: before UPnP %d, after UPnP %d", beforeUPnP, afterUPnP))
-	
-	// Phase 2: Allow network stack to stabilize and cleanup resources
-	TimestampLog("Phase 2: Stabilizing network resources...")
-	time.Sleep(1 * time.Second)
-	
-	// Force garbage collection to clean up any leaked resources
-	runtime.GC()
-	afterGC := runtime.NumGoroutine()
-	TimestampLog(fmt.Sprintf("Goroutines after GC: %d", afterGC))
-	
-	// Phase 3: Create P2P host only after UPnP cleanup
-	TimestampLog("Phase 3: Creating P2P host...")
-	p2pHost, multiAddr, err := NewHostWithRetry(config)
 	if err != nil {
-		return nil, "", fmt.Errorf("P2P host creation failed: %v", err)
+		c.appendDisplay("Connection error: " + err.Error())
+		return
 	}
-	
-	log.Printf("Started. Multiaddr: %s", multiAddr)
-	TimestampLog("=== Network Initialization Complete ===")
-	
-	return p2pHost, multiAddr, nil
+	c.conn = conn
+	c.connected = true
+	c.connectBtn.Disable()
+	c.disconnectBtn.Enable()
+	c.input.Enable()
+	c.appendDisplay("Connecting as " + c.nick + "...")
+
+	// Send registration
+	c.send("NICK " + c.nick)
+	c.send("USER " + c.nick + " 0 * :" + c.nick)
+	c.send("JOIN " + c.channel)
+
+	go c.readLoop()
+
+	// Switch to chat tab on connect
+	c.tabs.SelectIndex(1)
 }
 
-// setupUPnPWithResourceManagement handles UPnP setup with proper cleanup
-func setupUPnPWithResourceManagement(port int) (*UPnPManager, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	
-	manager := NewUPnPManager()
-	
-	if err := manager.DiscoverAndSetupPortMapping(ctx, port); err != nil {
-		manager.Close()
-		return nil, err
+func (c *IRCClient) disconnect() {
+	if c.conn != nil {
+		c.send("QUIT :Bye")
+		c.conn.Close()
+		c.conn = nil
+		c.connected = false
+		c.connectBtn.Enable()
+		c.disconnectBtn.Disable()
+		c.input.Disable()
+		c.appendDisplay("Disconnected.")
 	}
-	
-	return manager, nil
 }
 
-// NewHostWithRetry creates P2P host with retry logic for better reliability
-func NewHostWithRetry(config *Config) (host.Host, string, error) {
-	maxRetries := 3
-	baseDelay := 1 * time.Second
-	
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		TimestampLog(fmt.Sprintf("P2P host creation attempt %d/%d", attempt, maxRetries))
-		
-		// Try to create host
-		h, addr, createErr := NewHost(config)
-		if createErr == nil {
-			TimestampLog("P2P host created successfully")
-			return h, addr, nil
+func (c *IRCClient) readLoop() {
+	reader := ircreader.NewIRCReader(c.conn)
+	for c.conn != nil {
+		line, err := reader.ReadLine()
+		if err != nil {
+			fyne.DoAndWait(func() {
+				c.appendDisplay("Read error: " + err.Error())
+				c.disconnect()
+				time.Sleep(c.reconnect)
+				c.reconnect *= 2
+				if c.reconnect > time.Minute {
+					c.reconnect = time.Minute
+				}
+			})
+			return
 		}
-		
-		TimestampLog(fmt.Sprintf("P2P host creation attempt %d failed: %v", attempt, createErr))
-		
-		if attempt < maxRetries {
-			delay := time.Duration(attempt) * baseDelay
-			TimestampLog(fmt.Sprintf("Retrying in %v...", delay))
-			time.Sleep(delay)
+
+		msg, err := ircmsg.ParseLine(string(line))
+		if err != nil {
+			continue
+		}
+		fyne.DoAndWait(func() {
+			c.handleLine(msg)
+		})
+	}
+}
+
+func (c *IRCClient) handleLine(msg ircmsg.Message) {
+	if msg.Command == "PING" {
+		c.send("PONG :" + msg.Params[0])
+		return
+	}
+
+	// Extract user from source
+	user := ""
+	if msg.Source != "" {
+		user = strings.Split(msg.Source, "!")[0]
+	}
+
+	switch msg.Command {
+	case "001":
+		c.appendDisplay("Connected to server.")
+	case "433": // Nick in use
+		c.appendDisplay("Nick in use; regenerating...")
+		rnd := make([]byte, 4)
+		rand.Read(rnd)
+		newNick := fmt.Sprintf("%s_%s", strings.Split(c.nick, "_")[0], hex.EncodeToString(rnd))
+		c.send("NICK " + newNick)
+		c.nick = newNick
+	case "JOIN":
+		if user == c.nick {
+			c.appendDisplay("Joined " + c.channel)
 		} else {
-			return nil, "", fmt.Errorf("P2P host creation failed after %d attempts: %v", maxRetries, createErr)
+			c.appendDisplay(user + " joined.")
 		}
+	case "PRIVMSG":
+		if len(msg.Params) < 2 {
+			return
+		}
+		target, text := strings.ToLower(msg.Params[0]), msg.Params[1]
+		if target == strings.ToLower(c.channel) || target == strings.ToLower(c.nick) {
+			c.appendDisplay(fmt.Sprintf("%s: %s", user, text))
+		}
+	default:
+		// Other: MOTD, etc.
+		c.appendDisplay(msg.Command + " " + strings.Join(msg.Params, " "))
 	}
-	
-	return nil, "", fmt.Errorf("unexpected error in retry logic")
 }
 
-// configFileExists checks if the configuration file exists
-func configFileExists(filePath string) bool {
-	_, err := os.Stat(filePath)
-	return err == nil
+func (c *IRCClient) send(cmd string) {
+	if c.conn == nil {
+		return
+	}
+	fmt.Fprintf(c.conn, "%s\r\n", cmd)
 }
 
-// isLanIP determines if an IP address appears to be a local network IP
-func isLanIP(ip string) bool {
-	return ip == "127.0.0.1" || 
-		   ip == "localhost" ||
-		   (len(ip) >= 8 && ip[:8] == "192.168.") ||
-		   (len(ip) >= 3 && ip[:3] == "10.") ||
-		   (len(ip) >= 8 && ip[:8] == "172.16.") ||
-		   (len(ip) >= 8 && ip[:8] == "172.17.") ||
-		   (len(ip) >= 8 && ip[:8] == "172.18.") ||
-		   (len(ip) >= 8 && ip[:8] == "172.19.") ||
-		   (len(ip) >= 7 && ip[:7] == "172.2") ||
-		   (len(ip) >= 7 && ip[:7] == "172.3")
+func (c *IRCClient) appendDisplay(text string) {
+	c.display.SetText(c.display.Text + text + "\n")
+	c.display.Refresh()
+	c.scrollDisplay.ScrollToBottom()
+}
+
+func (c *IRCClient) appendDisplaySafe(text string) {
+	fyne.Do(func() {
+		c.appendDisplay(text)
+	})
 }
 
 // -----------------END OF FILE-------------main.go

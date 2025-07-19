@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"log"
 	"io"
 	"net"
 	"net/http"
@@ -92,6 +93,59 @@ func detectLanIP() string {
 	return "127.0.0.1"
 }
 
+
+// detectWanIPNonInteractive attempts to detect the public IP address without user interaction
+func detectWanIPNonInteractive() string {
+	// HTTP and HTTPS services for IP detection
+	services := []string{
+		"https://api.ipify.org",
+		"https://checkip.amazonaws.com",
+		"https://ipinfo.io/ip",
+		"https://api.ipsimple.org/ipv4",
+		"http://ipecho.net/plain",
+		"http://icanhazip.com",
+		"http://ifconfig.me",
+		"https://ipapi.co/ip",
+	}
+
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+	}
+
+	for _, service := range services {
+		TimestampLog(fmt.Sprintf("Trying IP detection service: %s", service))
+		
+		resp, err := client.Get(service)
+		if err != nil {
+			TimestampLog(fmt.Sprintf("Failed to connect to %s: %v", service, err))
+			continue
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		
+		if err != nil {
+			TimestampLog(fmt.Sprintf("Failed to read response from %s: %v", service, err))
+			continue
+		}
+
+		ipStr := strings.TrimSpace(string(body))
+		TimestampLog(fmt.Sprintf("Received from %s: '%s' (Status: %d)", service, ipStr, resp.StatusCode))
+
+		// Validate IP address
+		ip := net.ParseIP(ipStr)
+		if ip != nil && ip.To4() != nil && ipStr != "0.0.0.0" && ipStr != "127.0.0.1" {
+			TimestampLog(fmt.Sprintf("Detected WAN IP using %s: %s", service, ipStr))
+			return ipStr
+		} else {
+			TimestampLog(fmt.Sprintf("Invalid IP from %s: %s", service, ipStr))
+		}
+	}
+
+	TimestampLog("WARNING: All automatic WAN IP detection services failed.")
+	return "" // Return empty string instead of prompting user
+}
+
 // detectWanIP attempts to detect the public IP address using multiple services
 func detectWanIP() string {
 	// HTTP and HTTPS services for IP detection
@@ -142,11 +196,11 @@ func detectWanIP() string {
 
 	// All automatic detection failed, ask user for manual input
 	TimestampLog("WARNING: All automatic WAN IP detection services failed.")
-	fmt.Println("Visit https://whatismyipaddress.com or similar to find your public IP.")
+	log.Println("Visit https://whatismyipaddress.com or similar to find your public IP.")
 	
 	scanner := bufio.NewScanner(os.Stdin)
 	for {
-		fmt.Print("Enter your public IP manually: ")
+		log.Print("Enter your public IP manually: ")
 		scanner.Scan()
 		manualIP := strings.TrimSpace(scanner.Text())
 		
@@ -156,7 +210,7 @@ func detectWanIP() string {
 			TimestampLog(fmt.Sprintf("Using manually entered WAN IP: %s", manualIP))
 			return manualIP
 		} else {
-			fmt.Println("ERROR: Invalid IP format. Please try again.")
+			log.Println("ERROR: Invalid IP format. Please try again.")
 		}
 	}
 }
@@ -186,8 +240,8 @@ func findFreeListenPort(basePort int) int {
 
 	// No free port found in range
 	TimestampLog(fmt.Sprintf("ERROR: No free port in range %d-%d!", basePort, maxPort))
-	fmt.Printf("ERROR: No free port in range %d-%d!\n", basePort, maxPort)
-	fmt.Println("Press Enter to exit...")
+	log.Printf("ERROR: No free port in range %d-%d!\n", basePort, maxPort)
+	log.Println("Press Enter to exit...")
 	bufio.NewScanner(os.Stdin).Scan()
 	os.Exit(1)
 	return 0
@@ -210,8 +264,8 @@ func createFirewallRule(port int) error {
 		return nil
 	} else {
 		TimestampLog(fmt.Sprintf("WARNING: Failed to create firewall rule for port %d", port))
-		fmt.Printf("WARNING: Failed to create firewall rule for port %d\n", port)
-		fmt.Println("Application may not receive connections. Check if running as admin.")
+		log.Printf("WARNING: Failed to create firewall rule for port %d\n", port)
+		log.Println("Application may not receive connections. Check if running as admin.")
 		return fmt.Errorf("firewall rule creation failed")
 	}
 }
@@ -237,7 +291,7 @@ func validateName(name, fieldName string) bool {
 	// Only allow letters, numbers, and underscores
 	validName := regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
 	if !validName.MatchString(name) {
-		fmt.Printf("ERROR: %s cannot contain spaces, hyphens, or special characters. Use underscores instead.\n", fieldName)
+		log.Printf("ERROR: %s cannot contain spaces, hyphens, or special characters. Use underscores instead.\n", fieldName)
 		return false
 	}
 	return true
@@ -251,14 +305,14 @@ func testNetworkConnectivity() {
 	conn, err := net.DialTimeout("tcp", "8.8.8.8:53", 3*time.Second)
 	if err != nil {
 		TimestampLog("WARNING: No internet connectivity detected")
-		fmt.Println("WARNING: No internet connectivity detected")
-		fmt.Println("IRC connection may fail")
+		log.Println("WARNING: No internet connectivity detected")
+		log.Println("IRC connection may fail")
 		return
 	}
 	conn.Close()
 	
 	TimestampLog("OK: Network connectivity confirmed")
-	fmt.Println("OK: Network connectivity confirmed")
+	log.Println("OK: Network connectivity confirmed")
 }
 
 // testDirectoryPermissions tests if we can write to a directory
@@ -290,10 +344,10 @@ func testDirectoryPermissions(dir string) error {
 
 // runInteractiveSetup runs the interactive setup wizard
 func runInteractiveSetup() *Config {
-	fmt.Println("===============================================================")
-	fmt.Println("                    CUP AND STRING P2P FILE SYNC")
-	fmt.Println("===============================================================")
-	fmt.Println()
+	log.Println("===============================================================")
+	log.Println("                    CUP AND STRING P2P FILE SYNC")
+	log.Println("===============================================================")
+	log.Println()
 
 	// Default values
 	config := &Config{
@@ -316,17 +370,17 @@ func runInteractiveSetup() *Config {
 
 	scanner := bufio.NewScanner(os.Stdin)
 
-	fmt.Println("Enter configuration (press Enter for defaults):")
-	fmt.Println()
-	fmt.Println("WARNING: Names are CASE SENSITIVE. Use only letters, numbers, and underscores.")
-	fmt.Println("Do NOT use spaces, hyphens, or special characters like @#$%^&*")
-	fmt.Println()
+	log.Println("Enter configuration (press Enter for defaults):")
+	log.Println()
+	log.Println("WARNING: Names are CASE SENSITIVE. Use only letters, numbers, and underscores.")
+	log.Println("Do NOT use spaces, hyphens, or special characters like @#$%^&*")
+	log.Println()
 
 	// Network type selection
-	fmt.Println("Are you connecting to the recipient on the same local network or over the Internet?")
-	fmt.Println("  1 = Same local network (LAN) - faster, more reliable")
-	fmt.Println("  2 = Over the Internet (WAN) - works anywhere but slower")
-	fmt.Print("Enter choice [1]: ")
+	log.Println("Are you connecting to the recipient on the same local network or over the Internet?")
+	log.Println("  1 = Same local network (LAN) - faster, more reliable")
+	log.Println("  2 = Over the Internet (WAN) - works anywhere but slower")
+	log.Print("Enter choice [1]: ")
 	scanner.Scan()
 	networkInput := strings.TrimSpace(scanner.Text())
 	
@@ -337,17 +391,17 @@ func runInteractiveSetup() *Config {
 	} else {
 		config.ExternalIP = detectLanIP()
 	}
-	fmt.Printf("Detected IP: %s\n", config.ExternalIP)
+	log.Printf("Detected IP: %s\n", config.ExternalIP)
 
 	// IRC server
-	fmt.Printf("IRC server [%s]: ", config.IRCServer)
+	log.Printf("IRC server [%s]: ", config.IRCServer)
 	scanner.Scan()
 	if input := strings.TrimSpace(scanner.Text()); input != "" {
 		config.IRCServer = input
 	}
 
 	// IRC port
-	fmt.Printf("IRC port [%d]: ", config.IRCPort)
+	log.Printf("IRC port [%d]: ", config.IRCPort)
 	scanner.Scan()
 	if input := strings.TrimSpace(scanner.Text()); input != "" {
 		if port, err := strconv.Atoi(input); err == nil {
@@ -356,13 +410,13 @@ func runInteractiveSetup() *Config {
 	}
 
 	// TLS
-	fmt.Print("Use TLS (secure connection)? (Y/N) [Y]: ")
+	log.Print("Use TLS (secure connection)? (Y/N) [Y]: ")
 	scanner.Scan()
 	tlsInput := strings.ToLower(strings.TrimSpace(scanner.Text()))
 	config.TLSEnabled = !(tlsInput == "n" || tlsInput == "no")
 
 	// Local port
-	fmt.Printf("Local listen port [%d]: ", config.LocalPort)
+	log.Printf("Local listen port [%d]: ", config.LocalPort)
 	scanner.Scan()
 	if input := strings.TrimSpace(scanner.Text()); input != "" {
 		if port, err := strconv.Atoi(input); err == nil {
@@ -374,27 +428,27 @@ func runInteractiveSetup() *Config {
 	config.LocalPort = findFreeListenPort(config.LocalPort)
 
 	// Export folder
-	fmt.Printf("Export folder [%s]: ", config.ExportFolder)
+	log.Printf("Export folder [%s]: ", config.ExportFolder)
 	scanner.Scan()
 	if input := strings.TrimSpace(scanner.Text()); input != "" {
 		config.ExportFolder = input
 	}
 
 	// Import folder
-	fmt.Printf("Import folder [%s]: ", config.ImportFolder)
+	log.Printf("Import folder [%s]: ", config.ImportFolder)
 	scanner.Scan()
 	if input := strings.TrimSpace(scanner.Text()); input != "" {
 		config.ImportFolder = input
 	}
 
-	fmt.Println()
-	fmt.Println("IRC Channel Configuration:")
-	fmt.Println("(Use only letters, numbers, and underscores - NO spaces or special chars)")
-	fmt.Println()
+	log.Println()
+	log.Println("IRC Channel Configuration:")
+	log.Println("(Use only letters, numbers, and underscores - NO spaces or special chars)")
+	log.Println()
 
 	// Channel name
 	for {
-		fmt.Printf("IRC channel name [%s]: ", config.ChannelName)
+		log.Printf("IRC channel name [%s]: ", config.ChannelName)
 		scanner.Scan()
 		input := strings.TrimSpace(scanner.Text())
 		if input == "" {
@@ -408,7 +462,7 @@ func runInteractiveSetup() *Config {
 
 	// Your username
 	for {
-		fmt.Print("Your username []: ")
+		log.Print("Your username []: ")
 		scanner.Scan()
 		input := strings.TrimSpace(scanner.Text())
 		if input == "" {
@@ -422,7 +476,7 @@ func runInteractiveSetup() *Config {
 
 	// Recipient username
 	for {
-		fmt.Print("Recipient username []: ")
+		log.Print("Recipient username []: ")
 		scanner.Scan()
 		input := strings.TrimSpace(scanner.Text())
 		if input == "" {
@@ -436,7 +490,7 @@ func runInteractiveSetup() *Config {
 
 	// Pairing secret
 	for {
-		fmt.Printf("What are we talking about? [%s]: ", config.PairingSecret)
+		log.Printf("What are we talking about? [%s]: ", config.PairingSecret)
 		scanner.Scan()
 		input := strings.TrimSpace(scanner.Text())
 		if input == "" {
@@ -449,50 +503,44 @@ func runInteractiveSetup() *Config {
 	}
 
 	// Display configuration summary
-	fmt.Println()
-	fmt.Println("Configuration set:")
-	fmt.Printf("  Network Type: %s\n", networkType)
-	fmt.Printf("  Your IP: %s\n", config.ExternalIP)
-	fmt.Printf("  IRC Server: %s\n", config.IRCServer)
-	fmt.Printf("  IRC Port: %d\n", config.IRCPort)
-	fmt.Printf("  TLS Enabled: %t\n", config.TLSEnabled)
-	fmt.Printf("  Listen Port: %d\n", config.LocalPort)
-	fmt.Printf("  Export Folder: %s\n", config.ExportFolder)
-	fmt.Printf("  Import Folder: %s\n", config.ImportFolder)
-	fmt.Printf("  Channel: %s\n", config.ChannelName)
-	fmt.Printf("  Your Username: %s\n", config.YourUsername)
-	fmt.Printf("  Recipient: %s\n", config.RecipientUsername)
-	fmt.Printf("  Pairing Secret: %s\n", config.PairingSecret)
+	TimestampLog("Configuration set:")
+	TimestampLog(fmt.Sprintf("  Network Type: %s", networkType))
+	TimestampLog(fmt.Sprintf("  Your IP: %s", config.ExternalIP))
+	TimestampLog(fmt.Sprintf("  IRC Server: %s", config.IRCServer))
+	TimestampLog(fmt.Sprintf("  IRC Port: %d", config.IRCPort))
+	TimestampLog(fmt.Sprintf("  TLS Enabled: %t", config.TLSEnabled))
+	TimestampLog(fmt.Sprintf("  Listen Port: %d", config.LocalPort))
+	TimestampLog(fmt.Sprintf("  Export Folder: %s", config.ExportFolder))
+	TimestampLog(fmt.Sprintf("  Import Folder: %s", config.ImportFolder))
+	TimestampLog(fmt.Sprintf("  Channel: %s", config.ChannelName))
+	TimestampLog(fmt.Sprintf("  Your Username: %s", config.YourUsername))
+	TimestampLog(fmt.Sprintf("  Recipient: %s", config.RecipientUsername))
+	TimestampLog(fmt.Sprintf("  Pairing Secret: %s", config.PairingSecret))
 
 	return config
 }
 
 // setupDirectories creates and tests the export and import directories
 func setupDirectories(config *Config) error {
-	fmt.Println()
-	fmt.Println("[2/5] Setting up directories...")
+	TimestampLog("[2/5] Setting up directories...")
 
 	// Create export folder
 	if _, err := os.Stat(config.ExportFolder); os.IsNotExist(err) {
-		fmt.Printf("Creating directory: %s\n", config.ExportFolder)
 		TimestampLog(fmt.Sprintf("Creating directory: %s", config.ExportFolder))
 		if err := os.MkdirAll(config.ExportFolder, 0755); err != nil {
 			return fmt.Errorf("failed to create export folder: %v", err)
 		}
 	} else {
-		fmt.Printf("OK: Directory exists: %s\n", config.ExportFolder)
 		TimestampLog(fmt.Sprintf("OK: Directory exists: %s", config.ExportFolder))
 	}
 
 	// Create import folder
 	if _, err := os.Stat(config.ImportFolder); os.IsNotExist(err) {
-		fmt.Printf("Creating directory: %s\n", config.ImportFolder)
 		TimestampLog(fmt.Sprintf("Creating directory: %s", config.ImportFolder))
 		if err := os.MkdirAll(config.ImportFolder, 0755); err != nil {
 			return fmt.Errorf("failed to create import folder: %v", err)
 		}
 	} else {
-		fmt.Printf("OK: Directory exists: %s\n", config.ImportFolder)
 		TimestampLog(fmt.Sprintf("OK: Directory exists: %s", config.ImportFolder))
 	}
 
@@ -500,14 +548,12 @@ func setupDirectories(config *Config) error {
 	if err := testDirectoryPermissions(config.ExportFolder); err != nil {
 		return fmt.Errorf("no write permission for export folder %s: %v", config.ExportFolder, err)
 	}
-	fmt.Printf("OK: Write permissions confirmed for export folder\n")
 	TimestampLog("OK: Write permissions confirmed for export folder")
 
 	// Test write permissions for import folder
 	if err := testDirectoryPermissions(config.ImportFolder); err != nil {
 		return fmt.Errorf("no write permission for import folder %s: %v", config.ImportFolder, err)
 	}
-	fmt.Printf("OK: Write permissions confirmed for import folder\n")
 	TimestampLog("OK: Write permissions confirmed for import folder")
 
 	return nil
@@ -515,9 +561,8 @@ func setupDirectories(config *Config) error {
 
 // saveConfiguration saves the configuration to mysetup.json
 func saveConfiguration(config *Config) error {
-	fmt.Println()
-	fmt.Println("[3/5] Saving configuration...")
-	fmt.Println("Saving configuration to mysetup.json...")
+	TimestampLog("[3/5] Saving configuration...")
+	TimestampLog("Saving configuration to mysetup.json...")
 
 	// Convert Windows paths to JSON format (forward slashes)
 	config.ExportFolder = filepath.ToSlash(config.ExportFolder)
@@ -531,35 +576,30 @@ func saveConfiguration(config *Config) error {
 		return fmt.Errorf("failed to save configuration: %v", err)
 	}
 
-	fmt.Println("OK: Configuration saved to mysetup.json")
 	TimestampLog("OK: Configuration saved to mysetup.json")
 	return nil
 }
 
 // performSystemChecks performs pre-flight system checks
 func performSystemChecks(config *Config) error {
-	fmt.Println()
-	fmt.Println("[4/5] Pre-flight system check...")
+	TimestampLog("[4/5] Pre-flight system check...")
 
 	// Test network connectivity
 	testNetworkConnectivity()
 
 	// Check UPnP support
-	fmt.Println("Checking UPnP support for automatic port opening...")
+	TimestampLog("Checking UPnP support for automatic port opening...")
 	if checkUPnPSupport() {
-		fmt.Println("OK: UPnP support detected")
-		TimestampLog("UPnP support confirmed")
+		TimestampLog("OK: UPnP support detected")
 		
 		// Optionally show available devices for debugging
 		discoverUPnPDevices()
 	} else {
-		fmt.Println("WARNING: No UPnP support detected")
-		fmt.Println("You may need to manually configure port forwarding on your router")
 		TimestampLog("WARNING: No UPnP support detected")
+		TimestampLog("You may need to manually configure port forwarding on your router")
 	}
 
 	// Create firewall rule
-	fmt.Printf("Setting up firewall rule for port %d...\n", config.LocalPort)
 	TimestampLog(fmt.Sprintf("Setting up firewall rule for port %d...", config.LocalPort))
 	createFirewallRule(config.LocalPort)
 
@@ -568,27 +608,23 @@ func performSystemChecks(config *Config) error {
 
 // RunSetup runs the complete setup process
 func RunSetup() *Config {
-	fmt.Println("[1/5] Loading configuration...")
+	TimestampLog("[1/5] Loading configuration...")
 
 	var config *Config
 
 	// Check if config file exists
 	if _, err := os.Stat("mysetup.json"); err == nil {
-		fmt.Println("Found existing configuration file")
-		fmt.Println()
-		fmt.Println("Auto-loading saved configuration...")
-		fmt.Println()
-		fmt.Println("TO RECONFIGURE SOFTWARE")
-		fmt.Println("DELETE OR RENAME mysetup.json")
-		fmt.Println()
+		TimestampLog("Found existing configuration file")
+		TimestampLog("Auto-loading saved configuration...")
+		TimestampLog("TO RECONFIGURE SOFTWARE")
+		TimestampLog("DELETE OR RENAME mysetup.json")
 
 		// Load existing config
 		var err error
 		config, err = LoadConfig("mysetup.json")
 		if err != nil {
 			TimestampLog(fmt.Sprintf("Failed to load existing config: %v", err))
-			fmt.Printf("Failed to load existing config: %v\n", err)
-			fmt.Println("Running interactive setup...")
+			TimestampLog("Running interactive setup...")
 			config = runInteractiveSetup()
 		} else {
 			// Re-detect IP and port for existing config
@@ -599,48 +635,36 @@ func RunSetup() *Config {
 				// Assume WAN
 				config.ExternalIP = detectWanIP()
 			}
-			fmt.Printf("Detected IP: %s\n", config.ExternalIP)
 			TimestampLog(fmt.Sprintf("Detected IP: %s", config.ExternalIP))
 
 			// Find free listen port
 			config.LocalPort = findFreeListenPort(config.LocalPort)
-			fmt.Println("Configuration loaded successfully")
 			TimestampLog("Configuration loaded successfully")
 		}
 	} else {
-		fmt.Println("No existing configuration found, will create new one")
-		fmt.Println()
+		TimestampLog("No existing configuration found, will create new one")
 		config = runInteractiveSetup()
 	}
 
 	// Setup directories
 	if err := setupDirectories(config); err != nil {
 		TimestampLog(fmt.Sprintf("Directory setup failed: %v", err))
-		fmt.Printf("ERROR: %v\n", err)
-		fmt.Println("Press Enter to exit...")
-		bufio.NewScanner(os.Stdin).Scan()
 		os.Exit(1)
 	}
 
 	// Save configuration
 	if err := saveConfiguration(config); err != nil {
 		TimestampLog(fmt.Sprintf("Configuration save failed: %v", err))
-		fmt.Printf("ERROR: %v\n", err)
-		fmt.Println("Press Enter to exit...")
-		bufio.NewScanner(os.Stdin).Scan()
 		os.Exit(1)
 	}
 
 	// Perform system checks
 	if err := performSystemChecks(config); err != nil {
 		TimestampLog(fmt.Sprintf("System checks failed: %v", err))
-		fmt.Printf("WARNING: %v\n", err)
 		// Don't exit on system check failures, just warn
 	}
 
-	fmt.Println()
-	fmt.Println("[5/5] Starting Cup and String P2P File Sync...")
-	fmt.Println()
+	TimestampLog("[5/5] Starting Cup and String P2P File Sync...")
 	TimestampLog("Setup completed, starting P2P file sync")
 
 	return config
@@ -652,12 +676,10 @@ func CleanupSetup() {
 	defer func() {
 		if r := recover(); r != nil {
 			TimestampLog(fmt.Sprintf("Cleanup panic recovered: %v", r))
-			fmt.Printf("WARNING: Cleanup failed with panic: %v\n", r)
 		}
 	}()
 	
 	TimestampLog("Performing setup cleanup...")
-	fmt.Println("Performing cleanup...")
 	
 	// Remove UPnP port mapping using the global manager
 	if upnpManager != nil {
